@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
-import logging
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 import os
@@ -13,20 +12,6 @@ from langchain.chains import LLMChain
 from langchain.memory import ConversationBufferMemory
 from langchain.llms import HuggingFacePipeline
 from transformers import pipeline
-
-# 기본 로거 가져오기
-logger = logging.getLogger(__name__)
-
-# 로깅 레벨 설정 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-logger.setLevel(logging.DEBUG)
-
-# 콘솔 핸들러 생성 및 포매터 설정
-console_handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-
-# 로거에 핸들러 추가
-logger.addHandler(console_handler)
 
 load_dotenv()
 
@@ -46,7 +31,6 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 
 EMBEDDING_MODEL_NAME = "llama-text-embed-v2"
 
-
 print(f"PINECONE_API_KEY: {PINECONE_API_KEY}")
 print(f"PINECONE_ENVIRONMENT: {PINECONE_ENVIRONMENT}")
 print(f"PINECONE_INDEX_NAME: {PINECONE_INDEX_NAME}")
@@ -61,16 +45,19 @@ index = None
 langchain_llm = None
 llm_chain = None
 
-# LLM 모델을 LangChain용으로 감쌈
+    # LLM 모델을 LangChain용으로 감쌈
 def wrap_llm_with_langchain(model, tokenizer):
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        # device=0 if torch.cuda.is_available() else -1,
         max_new_tokens=1024,
         temperature=0.7,
-        top_p=0.9
+        top_p=0.9,
+        do_sample=True,
+        repetition_penalty=1.2,
+        pad_token_id=tokenizer.eos_token_id,
+        return_full_text=False  # 입력 프롬프트 제외하고 생성된 텍스트만 반환
     )
     return HuggingFacePipeline(pipeline=pipe)
 
@@ -113,7 +100,7 @@ def embed_text(text: str):
         parameters={"input_type": "passage", "truncate": "END"}
     )
     print(result)
-    return result['data'][0]['values']
+    return result.data[0]['values']
 
 # --- 검색 함수 ---
 def query_pinecone(text: str, top_k: int = 2):
@@ -123,7 +110,7 @@ def query_pinecone(text: str, top_k: int = 2):
         top_k=top_k,
         include_metadata=True
     )
-    return query_result['matches']
+    return query_result['matches'] # dictionary에서 'matches' 키를 통해 검색된 결과를 가져옴
 
 @app.on_event("startup")
 async def startup_event():
@@ -137,37 +124,35 @@ async def startup_event():
     if not all([PINECONE_API_KEY, PINECONE_ENVIRONMENT, PINECONE_INDEX_NAME]):
         raise ValueError("PINECONE 관련 환경변수가 누락되었습니다.")
 
-        # LangChain용 LLM 래핑
+    # LangChain용 LLM 래핑
     langchain_llm = wrap_llm_with_langchain(llm_model, tokenizer)
-
-    # 프롬프트 템플릿 생성
-    prompt = ChatPromptTemplate.from_template("""
-        당신은 질문에 대해 주어진 컨텍스트를 바탕으로 답변하는 AI 어시스턴트입니다.
-        컨텍스트를 사용하여 사용자의 질문에 최대한 상세하고 친절하게 한국어로 답변해주세요.
-        컨텍스트에서 답을 찾을 수 없다면, "컨텍스트에서 관련된 정보를 찾을 수 없습니다."라고 답변해주세요.
-
-        컨텍스트:
-        {context}
-
-        질문:
-        {question}
-    """)
-
-    # 메모리 추가
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-    # LLMChain 생성
-    llm_chain = LLMChain(
-        llm=langchain_llm,
-        prompt=prompt,
-        memory=memory,
-        verbose=True  # 디버깅용 로그 출력
-    )
 
     # Pinecone 클라이언트 및 인덱스 초기화
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index("llama-text-embed-v2-index")
+    
+    # 메모리 추가
+    memory = ConversationBufferMemory(memory_key="chat_history", input_key="question", return_messages=False)
+    
+    # 프롬프트 템플릿 생성 - 입력 변수 명확히 지정
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "당신은 일상 영어 회화 AI 어시스턴트입니다. 컨텍스트를 사용하여 사용자의 질문에 간단하게 답변해주세요. 컨텍스트에서 답을 찾을 수 없다면, 일반적인 지식을 사용하여 답변하세요."),
+        ("human", "질문: {question}\n\n컨텍스트:\n{context}"),
+    ])
 
+    # LLMChain 생성 - 입력 키 명확히 지정
+    llm_chain = LLMChain(
+        llm=langchain_llm,
+        prompt=prompt,
+        memory=memory,  # 메모리 지정
+        verbose=True,  # 디버깅용 로그 출력
+        output_key="text"  # 출력 키 명확히 지정
+    )
+
+    print(f"LLMChain 입력 변수: {llm_chain.prompt.input_variables}")
+    print("모든 초기화 완료.")
+
+    print(f"LLMChain 입력 변수: {llm_chain.prompt.input_variables}")
     print("모든 초기화 완료.")
 
 class RAGQueryRequest(BaseModel):
@@ -175,13 +160,12 @@ class RAGQueryRequest(BaseModel):
 
 class RAGQueryResponse(BaseModel):
     answer: str
-    retrieved_context: list
 
 @app.post("/query_rag", response_model=RAGQueryResponse)
 async def query_rag_endpoint(request: RAGQueryRequest):
     if not llm_model or not tokenizer or not index or not llm_chain:
         raise HTTPException(status_code=503, detail="서버 초기화가 완료되지 않았습니다.")
-    
+
     if not request.query:
         raise HTTPException(status_code=400, detail="질문이 비어있습니다.")
 
@@ -189,28 +173,67 @@ async def query_rag_endpoint(request: RAGQueryRequest):
         print(f"[입력 쿼리] {request.query}")
         # 1. Pinecone에서 문서 검색
         matches = query_pinecone(request.query, top_k=2)
-        print(type(matches), matches)
+        
         retrieved_contexts = [
-            # {"page_content": match['metadata'].get('content', ''), "metadata": match['metadata']}
             {"page_content": match['metadata'].get('content', ''), "metadata": match['metadata']}
             for match in matches
         ]
 
-        # 2. 컨텍스트 조합
-        context_string = "\n\n".join([ctx["page_content"] for ctx in retrieved_contexts])
+        # 2. 컨텍스트 조합 - 최대 길이 제한
+        context_texts = [ctx["page_content"] for ctx in retrieved_contexts]
+        # 컨텍스트가 너무 길다면, 앞부분만 사용
+        max_context_length = 1000  # 적절한 길이로 조정
+        context_string = "\n\n".join(context_texts)
+        if len(context_string) > max_context_length:
+            context_string = context_string[:max_context_length] + "..."
 
-        # 3. LangChain LLMChain에 전달할 입력 구성
-        input_dict = {
-            "context": context_string,
-            "question": request.query
+        # 3. LangChain LLMChain에 전달할 입력 구성 - 입력 키 맞춤
+        chain_input = {
+            "question": request.query,
+            "context": context_string
         }
+        
+        print(f"LLMChain에 전달될 입력: {chain_input}")
 
         # 4. LangChain을 통한 응답 생성
-        answer = llm_chain.run(input_dict)
+        response = await llm_chain.ainvoke(chain_input)
+        
+        # 응답 추출 및 처리
+        if 'text' in response:
+            answer = response['text']
+        else:
+            # 응답 형식이 예상과 다를 경우 딕셔너리에서 문자열 값을 찾아 사용
+            print(f"예상치 못한 응답 형식: {response}")
+            for key, value in response.items():
+                if isinstance(value, str) and len(value) > 0:
+                    answer = value
+                    break
+            else:
+                answer = "응답을 처리하는 동안 오류가 발생했습니다."
+        
+        # 응답 정리 (앞뒤 공백 제거)
+        answer = answer.strip()
+        
+        print(f"[최종 모델 응답] {answer}")
+        return RAGQueryResponse(answer=answer)
 
-        print(f"[모델 응답] {answer}")
-        return RAGQueryResponse(answer=answer, retrieved_context=retrieved_contexts)
+    except Exception as e:
+        print(f"에러 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    except Exception as e:
+        print(f"에러 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
     except Exception as e:
         print(f"에러 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# 실행 명령어:
+# uvicorn rag_llm_fastapi_server:app --reload --port 8090
+# 테스트 명령어: 
+# curl -X POST http://127.0.0.1:8090/query_rag -H "Content-Type: application/json" -d "{\"query\": \"한국의 수도는 어디야?\"}"
