@@ -1,14 +1,32 @@
-# 생략된 import는 동일
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
+import logging
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 import os
 from pinecone import Pinecone
-import base64
-import json
 from dotenv import load_dotenv
+
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
+from langchain.memory import ConversationBufferMemory
+from langchain.llms import HuggingFacePipeline
+from transformers import pipeline
+
+# 기본 로거 가져오기
+logger = logging.getLogger(__name__)
+
+# 로깅 레벨 설정 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+logger.setLevel(logging.DEBUG)
+
+# 콘솔 핸들러 생성 및 포매터 설정
+console_handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+
+# 로거에 핸들러 추가
+logger.addHandler(console_handler)
 
 load_dotenv()
 
@@ -28,6 +46,11 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 
 EMBEDDING_MODEL_NAME = "llama-text-embed-v2"
 
+
+print(f"PINECONE_API_KEY: {PINECONE_API_KEY}")
+print(f"PINECONE_ENVIRONMENT: {PINECONE_ENVIRONMENT}")
+print(f"PINECONE_INDEX_NAME: {PINECONE_INDEX_NAME}")
+
 app = FastAPI()
 
 # 전역 변수
@@ -35,6 +58,22 @@ llm_model = None
 tokenizer = None
 pc = None
 index = None
+langchain_llm = None
+llm_chain = None
+
+# LLM 모델을 LangChain용으로 감쌈
+def wrap_llm_with_langchain(model, tokenizer):
+    pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        # device=0 if torch.cuda.is_available() else -1,
+        max_new_tokens=1024,
+        temperature=0.7,
+        top_p=0.9
+    )
+    return HuggingFacePipeline(pipeline=pipe)
+
 
 # --- 모델 로드 함수 ---
 def load_llm_and_tokenizer(base_model_id, lora_adapter_path, quant_config):
@@ -69,11 +108,12 @@ def load_llm_and_tokenizer(base_model_id, lora_adapter_path, quant_config):
 # --- Pinecone 임베딩 생성 ---
 def embed_text(text: str):
     result = pc.inference.embed(
-        model="llama-text-embed-v2-index",
+        model="llama-text-embed-v2",
         inputs=[text],
         parameters={"input_type": "passage", "truncate": "END"}
     )
-    return result['data'][0]['embedding']
+    print(result)
+    return result['data'][0]['values']
 
 # --- 검색 함수 ---
 def query_pinecone(text: str, top_k: int = 2):
@@ -87,7 +127,7 @@ def query_pinecone(text: str, top_k: int = 2):
 
 @app.on_event("startup")
 async def startup_event():
-    global llm_model, tokenizer, pc, index
+    global llm_model, tokenizer, pc, index, langchain_llm, llm_chain
 
     print("FastAPI 시작 - LLM 및 Pinecone 설정 중...")
 
@@ -97,9 +137,36 @@ async def startup_event():
     if not all([PINECONE_API_KEY, PINECONE_ENVIRONMENT, PINECONE_INDEX_NAME]):
         raise ValueError("PINECONE 관련 환경변수가 누락되었습니다.")
 
+        # LangChain용 LLM 래핑
+    langchain_llm = wrap_llm_with_langchain(llm_model, tokenizer)
+
+    # 프롬프트 템플릿 생성
+    prompt = ChatPromptTemplate.from_template("""
+        당신은 질문에 대해 주어진 컨텍스트를 바탕으로 답변하는 AI 어시스턴트입니다.
+        컨텍스트를 사용하여 사용자의 질문에 최대한 상세하고 친절하게 한국어로 답변해주세요.
+        컨텍스트에서 답을 찾을 수 없다면, "컨텍스트에서 관련된 정보를 찾을 수 없습니다."라고 답변해주세요.
+
+        컨텍스트:
+        {context}
+
+        질문:
+        {question}
+    """)
+
+    # 메모리 추가
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+    # LLMChain 생성
+    llm_chain = LLMChain(
+        llm=langchain_llm,
+        prompt=prompt,
+        memory=memory,
+        verbose=True  # 디버깅용 로그 출력
+    )
+
     # Pinecone 클라이언트 및 인덱스 초기화
     pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(PINECONE_INDEX_NAME)
+    index = pc.Index("llama-text-embed-v2-index")
 
     print("모든 초기화 완료.")
 
@@ -112,7 +179,7 @@ class RAGQueryResponse(BaseModel):
 
 @app.post("/query_rag", response_model=RAGQueryResponse)
 async def query_rag_endpoint(request: RAGQueryRequest):
-    if not llm_model or not tokenizer or not index:
+    if not llm_model or not tokenizer or not index or not llm_chain:
         raise HTTPException(status_code=503, detail="서버 초기화가 완료되지 않았습니다.")
     
     if not request.query:
@@ -122,37 +189,24 @@ async def query_rag_endpoint(request: RAGQueryRequest):
         print(f"[입력 쿼리] {request.query}")
         # 1. Pinecone에서 문서 검색
         matches = query_pinecone(request.query, top_k=2)
+        print(type(matches), matches)
         retrieved_contexts = [
-            {"page_content": match['metadata'].get('text', ''), "metadata": match['metadata']}
+            # {"page_content": match['metadata'].get('content', ''), "metadata": match['metadata']}
+            {"page_content": match['metadata'].get('content', ''), "metadata": match['metadata']}
             for match in matches
         ]
 
         # 2. 컨텍스트 조합
         context_string = "\n\n".join([ctx["page_content"] for ctx in retrieved_contexts])
 
-        # 3. 프롬프트 구성
-        prompt_template = f"""
-            당신은 질문에 대해 주어진 컨텍스트를 바탕으로 답변하는 AI 어시스턴트입니다.
-            컨텍스트를 사용하여 사용자의 질문에 최대한 상세하고 친절하게 한국어로 답변해주세요.
-            컨텍스트에서 답을 찾을 수 없다면, "컨텍스트에서 관련된 정보를 찾을 수 없습니다."라고 답변해주세요.
+        # 3. LangChain LLMChain에 전달할 입력 구성
+        input_dict = {
+            "context": context_string,
+            "question": request.query
+        }
 
-            컨텍스트: {context_string}
-
-            질문: {request.query}
-
-            답변:
-        """.strip()
-
-        # 4. 답변 생성
-        inputs = tokenizer(prompt_template, return_tensors="pt").to(llm_model.device)
-        output_ids = llm_model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            temperature=0.7,
-            top_p=0.9
-        )
-        answer = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        answer = answer[len(prompt_template):].strip() # 프롬프트 제거
+        # 4. LangChain을 통한 응답 생성
+        answer = llm_chain.run(input_dict)
 
         print(f"[모델 응답] {answer}")
         return RAGQueryResponse(answer=answer, retrieved_context=retrieved_contexts)
